@@ -19,6 +19,15 @@
 #include <sys/errno.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <immintrin.h>
+
+#ifdef __AVX__
+ // um_alloc uses an avx move on the free list, so the entire free list must
+ // be 32-byte aligned.
+ #define FREE_LIST_ALIGNMENT 32
+#else
+ #define FREE_LIST_ALIGNMENT 8
+#endif
 
 // The machine shall consist of the following components:
 
@@ -86,59 +95,82 @@ die(const char *msg) {
 // um_alloc never allocates the zero array, since it is specially reserved for
 // the currently executing program.
 int
+um_alloc_slot(struct um_state* state, platter_t cap, int fl_index, int bit) {
+  // The index that is ultimately going to be returned is the slot plus the
+  // bit - the index into the state's array table.
+  int index = bit + 64 * fl_index;
+
+  // The array table is initially small. If we need to expand it, do so here.
+  if (index >= state->num_arrays) {
+    state->num_arrays += index;
+    state->arrays =
+      realloc(state->arrays, state->num_arrays * sizeof(struct um_array));
+    if (!state->arrays) {
+      die("state arrays malloc");
+    }
+  }
+
+  // At this point we have chosen an index to allocate to this new array. It
+  // must not be zero (we never allocate the zero array) and it must point to
+  // a valid index in the array table.
+  //
+  // Allocate the requested capacity array and initialize the chosen array
+  // index with its pointer and length.
+  assert(index > 0);
+  assert(index < state->num_arrays);
+  state->arrays[index].size = cap;
+  state->arrays[index].ptr = calloc(cap, sizeof(platter_t));
+  if (!state->arrays[index].ptr) {
+    die("state arrays cap alloc");
+  }
+
+  // Zero out the new array.
+  memset(state->arrays[index].ptr, 0, cap * sizeof(platter_t));
+
+  // Clear the bit of the index we just allocated.
+  state->free_list[fl_index] &= ~(1UL << bit);
+  return index;
+}
+
+
+int
 um_alloc(struct um_state *state, platter_t cap) {
-  // This loop is performance critical.
+#ifdef __AVX__
+  // If AVX instructions are available, count each free list entry four at a time.
+  for (int i = 0; i < FREE_LIST_LENGTH; i += 4) {
+    // Load a 4x64 vector from the free list.
+    __m256i entry_vec = _mm256_loadu_si256((__m256i*)&state->free_list[i]);
+
+    // If the whole vector is zero, move on to the next four entries.
+    if (_mm256_testz_si256(entry_vec, entry_vec) == 1) {
+      continue;
+    }
+
+    // If at least one of the 64-bit integers in the vector is not zero, extract
+    // the one that's not zero and allocate that slot.
+    //
+    // Note that the compiler must unroll this loop in order for this code to compile,
+    // since the extract intrinsic requires a compile-time constant as its second argument.
+    for (uint8_t j = 0; j < 4; j++) {
+      uint64_t entry = _mm256_extract_epi64(entry_vec, j);
+      if (entry == 0) {
+        continue;
+      }
+
+      return um_alloc_slot(state, cap, i + j, __builtin_ffsl(entry) - 1);
+    }
+  }
+#else
+  // Slow implementation for non-AVX processors.
   for (int i = 0; i < FREE_LIST_LENGTH; i++) {
     uint64_t entry = state->free_list[i];
-
-    // If all bits in this entry are 0, there are no arrays free for allocation
-    // in this entry; move to the next one.
     if (entry == 0) {
       continue;
     }
 
-    // There exists a 1 bit in entry. Find it and return the index of the bit
-    // that is set.
-    int bit = __builtin_ffsl(entry) - 1;
-
-    // The "slot" is the offset of this entry in the state's array table.
-    int slot = 64 * i;
-
-    // The index that is ultimately going to be returned is the slot plus the
-    // bit - the index into the state's array table.
-    int index = bit + slot;
-
-    // The array table is initially small. If we need to expand it, do so here.
-    if (index >= state->num_arrays) {
-      state->num_arrays += index;
-      state->arrays =
-        realloc(state->arrays, state->num_arrays * sizeof(struct um_array));
-      if (!state->arrays) {
-        die("state arrays malloc");
-      }
-    }
-
-    // At this point we have chosen an index to allocate to this new array. It
-    // must not be zero (we never allocate the zero array) and it must point to
-    // a valid index in the array table.
-    //
-    // Allocate the requested capacity array and initialize the chosen array
-    // index with its pointer and length.
-    assert(index > 0);
-    assert(index < state->num_arrays);
-    state->arrays[index].size = cap;
-    state->arrays[index].ptr = calloc(cap, sizeof(platter_t));
-    if (!state->arrays[index].ptr) {
-      die("state arrays cap alloc");
-    }
-
-    // Zero out the new array.
-    memset(state->arrays[index].ptr, 0, cap * sizeof(platter_t));
-
-    // Clear the bit of the index we just allocated.
-    state->free_list[i] &= ~(1UL << bit);
-    return index;
+    return um_alloc_slot(state, cap, i, __builtin_ffsl(entry) - 1);
   }
+#endif // __AVX2__
 
   die("free list completely full");
   return -1;
@@ -208,7 +240,8 @@ um_state_init(struct um_state *state, const char* filename) {
   state->debug = false;
 
   // Allocate and zero our free list. We won't resize it (for now).
-  state->free_list = calloc(FREE_LIST_LENGTH, sizeof(uint64_t));
+  state->free_list = aligned_alloc(FREE_LIST_ALIGNMENT, FREE_LIST_LENGTH * sizeof(uint64_t));
+  // state->free_list = calloc(FREE_LIST_LENGTH, sizeof(uint64_t));
   if (!state->free_list) {
     die("malloc free list");
   }
