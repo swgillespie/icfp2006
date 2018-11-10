@@ -60,6 +60,8 @@ struct um_state {
 
   // A free list. See um_alloc and um_abandon for details.
   uint64_t *free_list;
+
+  int first_nonzero_index;
 };
 
 void
@@ -71,6 +73,11 @@ die(const char *msg) {
   }
 
   exit(1);
+}
+
+int
+min(int a, int b) {
+  return a < b ? a : b;
 }
 
 // For simplicity, this VM uses a fixed-size free list. It would not be hard to
@@ -135,42 +142,15 @@ um_alloc_slot(struct um_state* state, platter_t cap, int fl_index, int bit) {
 
 int
 um_alloc(struct um_state *state, platter_t cap) {
-#ifdef __AVX__
-  // If AVX instructions are available, count each free list entry four at a time.
-  for (int i = 0; i < FREE_LIST_LENGTH; i += 4) {
-    // Load a 4x64 vector from the free list.
-    __m256i entry_vec = _mm256_loadu_si256((__m256i*)&state->free_list[i]);
-
-    // If the whole vector is zero, move on to the next four entries.
-    if (_mm256_testz_si256(entry_vec, entry_vec) == 1) {
-      continue;
-    }
-
-    // If at least one of the 64-bit integers in the vector is not zero, extract
-    // the one that's not zero and allocate that slot.
-    //
-    // Note that the compiler must unroll this loop in order for this code to compile,
-    // since the extract intrinsic requires a compile-time constant as its second argument.
-    for (uint8_t j = 0; j < 4; j++) {
-      uint64_t entry = _mm256_extract_epi64(entry_vec, j);
-      if (entry == 0) {
-        continue;
-      }
-
-      return um_alloc_slot(state, cap, i + j, __builtin_ffsl(entry) - 1);
-    }
-  }
-#else
-  // Slow implementation for non-AVX processors.
-  for (int i = 0; i < FREE_LIST_LENGTH; i++) {
+  for (int i = state->first_nonzero_index; i < FREE_LIST_LENGTH; i++) {
     uint64_t entry = state->free_list[i];
     if (entry == 0) {
       continue;
     }
 
+    state->first_nonzero_index = i;
     return um_alloc_slot(state, cap, i, __builtin_ffsl(entry) - 1);
   }
-#endif // __AVX2__
 
   die("free list completely full");
   return -1;
@@ -184,6 +164,7 @@ um_abandon(struct um_state *state, int index) {
   free(state->arrays[index].ptr);
   state->arrays[index].size = 0;
   int slot = index / 64;
+  state->first_nonzero_index = min(state->first_nonzero_index, slot);
   int bit = index % 64;
   state->free_list[slot] |= (1UL << bit);
 }
@@ -251,6 +232,7 @@ um_state_init(struct um_state *state, const char* filename) {
   // Mark the zero array as permanently allocated. It always represents the
   // running program and should never be reallocated.
   state->free_list[0] &= ~1;
+  state->first_nonzero_index = 0;
 }
 
 // Simple debug routine that dumps out the next instruction to be executed. Not
